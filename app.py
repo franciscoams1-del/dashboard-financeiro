@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import hashlib
 import html
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from pandas_datareader import data as fred_data
 from streamlit_autorefresh import st_autorefresh
 
 
@@ -34,27 +36,69 @@ st.set_page_config(
 
 
 DEFAULT_ASSETS: dict[str, list[dict[str, str]]] = {
-    "Macro": [
-        {"ticker": "SPY", "name": "S&P 500 ETF"},
+    "Macro, Juros e Inflação": [
         {"ticker": "^VIX", "name": "Índice VIX"},
         {"ticker": "DX-Y.NYB", "name": "Dólar Index DXY"},
+        {"ticker": "^IRX", "name": "Treasury Yield 3M"},
+        {"ticker": "DGS1", "name": "Treasury Yield 1Y — FRED"},
+        {"ticker": "^FVX", "name": "Treasury Yield 5Y"},
+        {"ticker": "^TNX", "name": "Treasury Yield 10Y"},
+        {"ticker": "^TYX", "name": "Treasury Yield 30Y"},
+        {"ticker": "T10YIE", "name": "Inflação Implícita 10Y — FRED"},
     ],
-    "Cripto/Commodities": [
+    "ETFs Globais e Fatores": [
+        {"ticker": "SPY", "name": "S&P 500 ETF"},
+        {"ticker": "QQQ", "name": "Nasdaq 100 ETF"},
+        {"ticker": "SPHQ", "name": "S&P 500 Quality ETF"},
+        {"ticker": "SPQA", "name": "SPDR MSCI Global Quality Mix"},
+        {"ticker": "SMOT", "name": "VanEck Morningstar SMID Moat"},
+    ],
+    "Cripto & Derivados": [
         {"ticker": "BTC-USD", "name": "Bitcoin"},
-        {"ticker": "GC=F", "name": "Ouro — Futuros"},
+        {"ticker": "SOL-USD", "name": "Solana"},
+        {"ticker": "BITO", "name": "Bitcoin Strategy ETF"},
+        {"ticker": "MSTR", "name": "MicroStrategy — proxy BTC"},
     ],
-    "Tech/IA": [
+    "Commodities": [
+        {"ticker": "GLD", "name": "Ouro — ETF"},
+        {"ticker": "SI=F", "name": "Prata — Futuros"},
+        {"ticker": "HG=F", "name": "Cobre — Futuros"},
+        {"ticker": "ZS=F", "name": "Soja — Futuros"},
+        {"ticker": "ZC=F", "name": "Milho — Futuros"},
+        {"ticker": "SLX", "name": "Aço/Ferro — ETF"},
+    ],
+    "Tech, Semi & IA": [
+        {"ticker": "NVDA", "name": "NVIDIA"},
+        {"ticker": "ANET", "name": "Arista Networks"},
         {"ticker": "NBIS", "name": "Nebius"},
         {"ticker": "OKLO", "name": "Oklo"},
         {"ticker": "000660.KS", "name": "SK Hynix"},
-        {"ticker": "NVDA", "name": "NVIDIA — proxy CoreWeave"},
+        {"ticker": "APP", "name": "AppLovin"},
     ],
-    "Cybersecurity": [
+    "Cyber & Cloud": [
         {"ticker": "NET", "name": "Cloudflare"},
         {"ticker": "CRWD", "name": "CrowdStrike"},
         {"ticker": "PANW", "name": "Palo Alto Networks"},
         {"ticker": "ZS", "name": "Zscaler"},
+        {"ticker": "GTLB", "name": "GitLab"},
     ],
+    "Consumo, Saúde & Diversos": [
+        {"ticker": "DLO", "name": "dLocal"},
+        {"ticker": "PDD", "name": "PDD Holdings"},
+        {"ticker": "EXEL", "name": "Exelixis"},
+        {"ticker": "RMV.L", "name": "Rightmove"},
+        {"ticker": "GAW.L", "name": "Games Workshop"},
+        {"ticker": "DECK", "name": "Deckers Brands"},
+        {"ticker": "KPG.AX", "name": "Kelly Partners"},
+        {"ticker": "MEDP", "name": "Medpace"},
+        {"ticker": "WSO", "name": "Watsco"},
+    ],
+}
+
+
+FRED_SERIES: dict[str, str] = {
+    "DGS1": "DGS1",
+    "T10YIE": "T10YIE",
 }
 
 
@@ -299,9 +343,100 @@ def sum_statement_values(
 # Dados de mercado
 # ---------------------------------------------------------------------------
 
+def build_market_snapshot(
+    ticker: str,
+    data: pd.DataFrame,
+) -> dict[str, Any]:
+    """Calcula preço, variação diária, médias e distância das médias."""
+    if data.empty:
+        return {
+            "ticker": ticker,
+            "error": f"O Yahoo Finance/FRED não retornou histórico para {ticker}.",
+        }
+
+    data = data.copy()
+    data["MM7"] = data["Preço"].rolling(7, min_periods=1).mean()
+    data["MM30"] = data["Preço"].rolling(30, min_periods=1).mean()
+    data["MM180"] = data["Preço"].rolling(180, min_periods=1).mean()
+
+    latest_price = safe_float(data["Preço"].iloc[-1])
+    previous_price = (
+        safe_float(data["Preço"].iloc[-2])
+        if len(data) >= 2
+        else None
+    )
+
+    daily_change = None
+    if latest_price is not None and previous_price not in (None, 0):
+        daily_change = ((latest_price / previous_price) - 1) * 100
+
+    moving_average_distances: dict[str, float | None] = {}
+    for average_name in ("MM7", "MM30", "MM180"):
+        average = safe_float(data[average_name].iloc[-1])
+        moving_average_distances[average_name] = (
+            ((latest_price / average) - 1) * 100
+            if latest_price is not None and average not in (None, 0)
+            else None
+        )
+
+    return {
+        "ticker": ticker,
+        "history": data,
+        "price": latest_price,
+        "daily_change": daily_change,
+        "mm7": safe_float(data["MM7"].iloc[-1]),
+        "mm30": safe_float(data["MM30"].iloc[-1]),
+        "mm180": safe_float(data["MM180"].iloc[-1]),
+        "distance_mm7": moving_average_distances["MM7"],
+        "distance_mm30": moving_average_distances["MM30"],
+        "distance_mm180": moving_average_distances["MM180"],
+        "one_year_ago": safe_float(data["Preço"].iloc[0]),
+        "error": None,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_fred_market_data(ticker: str) -> dict[str, Any]:
+    """Busca séries macroeconômicas diretamente no banco de dados FRED."""
+    try:
+        series_id = FRED_SERIES[ticker]
+        start = datetime.utcnow() - timedelta(days=420)
+        end = datetime.utcnow()
+        history = fred_data.DataReader(series_id, "fred", start, end)
+
+        if history.empty or series_id not in history.columns:
+            return {
+                "ticker": ticker,
+                "error": f"O FRED não retornou dados para {ticker}.",
+            }
+
+        values = pd.to_numeric(history[series_id], errors="coerce").dropna()
+        dates = pd.to_datetime(values.index, errors="coerce")
+
+        data = pd.DataFrame(
+            {
+                "Data": dates,
+                "Preço": values.to_numpy(),
+            }
+        ).dropna()
+
+        return build_market_snapshot(ticker, data)
+    except Exception:
+        return {
+            "ticker": ticker,
+            "error": (
+                f"Não foi possível carregar {ticker} via FRED. "
+                "O indicador pode estar temporariamente indisponível."
+            ),
+        }
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_data(ticker: str) -> dict[str, Any]:
     """Baixa um ano de histórico e calcula preço, variação e médias móveis."""
+    if ticker in FRED_SERIES:
+        return fetch_fred_market_data(ticker)
+
     try:
         history = yf.Ticker(ticker).history(
             period="1y",
@@ -319,32 +454,7 @@ def fetch_market_data(ticker: str) -> dict[str, Any]:
                 ),
             }
 
-        data["MM7"] = data["Preço"].rolling(7, min_periods=1).mean()
-        data["MM30"] = data["Preço"].rolling(30, min_periods=1).mean()
-        data["MM180"] = data["Preço"].rolling(180, min_periods=1).mean()
-
-        latest_price = safe_float(data["Preço"].iloc[-1])
-        previous_price = (
-            safe_float(data["Preço"].iloc[-2])
-            if len(data) >= 2
-            else None
-        )
-
-        daily_change = None
-        if latest_price is not None and previous_price not in (None, 0):
-            daily_change = ((latest_price / previous_price) - 1) * 100
-
-        return {
-            "ticker": ticker,
-            "history": data,
-            "price": latest_price,
-            "daily_change": daily_change,
-            "mm7": safe_float(data["MM7"].iloc[-1]),
-            "mm30": safe_float(data["MM30"].iloc[-1]),
-            "mm180": safe_float(data["MM180"].iloc[-1]),
-            "one_year_ago": safe_float(data["Preço"].iloc[0]),
-            "error": None,
-        }
+        return build_market_snapshot(ticker, data)
     except Exception:
         return {
             "ticker": ticker,
@@ -398,6 +508,7 @@ def fetch_fundamentals(ticker: str, current_price: float | None) -> dict[str, An
         "net_debt_ebitda": None,
         "net_income_ltm": None,
         "pe_ltm": None,
+        "forward_pe": None,
         "pe_realtime": None,
         "roic": None,
         "roiic": None,
@@ -418,7 +529,18 @@ def fetch_fundamentals(ticker: str, current_price: float | None) -> dict[str, An
             ticker.startswith("^")
             or ticker.endswith("-USD")
             or ticker.endswith("=F")
-            or ticker in {"SPY", "GLD", "DX-Y.NYB"}
+            or ticker in FRED_SERIES
+            or ticker in {
+                "SPY",
+                "QQQ",
+                "SPHQ",
+                "SPQA",
+                "SMOT",
+                "BITO",
+                "GLD",
+                "SLX",
+                "DX-Y.NYB",
+            }
         )
 
         if quote_type in {
@@ -539,6 +661,7 @@ def fetch_fundamentals(ticker: str, current_price: float | None) -> dict[str, An
         )
 
         pe_ltm = safe_float(info.get("trailingPE"))
+        forward_pe = safe_float(info.get("forwardPE"))
         eps_ltm = safe_float(info.get("trailingEps"))
         pe_realtime = (
             current_price / eps_ltm
@@ -736,6 +859,7 @@ def fetch_fundamentals(ticker: str, current_price: float | None) -> dict[str, An
             "net_debt_ebitda": net_debt_ebitda,
             "net_income_ltm": net_income_ltm,
             "pe_ltm": pe_ltm,
+            "forward_pe": forward_pe,
             "pe_realtime": pe_realtime,
             "roic": roic,
             "roiic": roiic,
@@ -798,9 +922,9 @@ def render_market_card(asset: dict[str, str], data: dict[str, Any]) -> bool:
             <div class="price">{format_price(price)}</div>
             <div class="change">{format_percent(change)}</div>
             <div class="moving-averages">
-                MM7: {format_price(data.get("mm7"))}
-                &nbsp;·&nbsp; MM30: {format_price(data.get("mm30"))}
-                &nbsp;·&nbsp; MM180: {format_price(data.get("mm180"))}
+                Vs MM7: {format_percent(data.get("distance_mm7"))}<br>
+                Vs MM30: {format_percent(data.get("distance_mm30"))}<br>
+                Vs MM180: {format_percent(data.get("distance_mm180"))}
             </div>
             <div class="year-ago">
                 Preço há 1 ano: {format_price(data.get("one_year_ago"))}
@@ -889,7 +1013,7 @@ def render_fundamental_metrics(
         ("Dívida Líquida / EBITDA", format_compact_number(metrics["net_debt_ebitda"])),
         ("Lucro Líquido LTM", format_compact_number(metrics["net_income_ltm"])),
         ("P/E LTM", format_compact_number(metrics["pe_ltm"])),
-        ("P/E em tempo real", format_compact_number(metrics["pe_realtime"])),
+        ("Fwd P/E", format_compact_number(metrics["forward_pe"])),
         ("ROIC LTM", format_percent(
             metrics["roic"] * 100 if metrics["roic"] is not None else None
         )),
@@ -1039,8 +1163,8 @@ with st.sidebar:
 
 st.title("📈 Market Monitor")
 st.caption(
-    "Cards coloridos por desempenho diário, médias móveis, comparação anual "
-    "e análise fundamentalista."
+    "Painel único para monitorar mercado, juros, inflação, commodities, "
+    "cripto, tecnologia e análise fundamentalista."
 )
 
 st.warning(
@@ -1051,70 +1175,36 @@ st.warning(
     """
 )
 
-macro_tab, crypto_tab, tech_tab, cyber_tab, custom_tab = st.tabs(
-    [
-        "Macro",
-        "Cripto/Commodities",
-        "Tech/IA",
-        "Cybersecurity",
-        "Meus Tickers",
-    ]
-)
+for category_name, category_assets in DEFAULT_ASSETS.items():
+    render_category(category_name, category_assets)
 
-with macro_tab:
-    render_category("Macro", DEFAULT_ASSETS["Macro"])
+    if category_name == "Macro, Juros e Inflação":
+        st.caption(
+            "DGS1 e T10YIE são buscados no FRED via pandas-datareader. "
+            "Os demais indicadores usam o Yahoo Finance."
+        )
+
+    if category_name == "Commodities":
+        st.caption(
+            "Commodities são representadas por contratos futuros e ETFs "
+            "disponíveis no Yahoo Finance."
+        )
+
     st.divider()
-    st.subheader("Indicadores complementares")
-    fear_greed, grp = st.columns(2)
 
-    with fear_greed:
-        st.info(
-            """
-            **Fear & Greed Index — placeholder**
+st.subheader("Outros")
+custom_assets = [
+    {"ticker": ticker, "name": "Ativo personalizado"}
+    for ticker in st.session_state.custom_tickers
+]
 
-            Integração sugerida via API da Alternative.me ou outro provedor
-            autorizado. Exemplo de endpoint:
-            `https://api.alternative.me/fng/`
-            """
-        )
-
-    with grp:
-        st.info(
-            """
-            **GRP Index — placeholder**
-
-            Como não existe ticker nativo confiável no Yahoo Finance, integre
-            por API oficial de terceiros ou web scraping autorizado, respeitando
-            os termos de uso e o robots.txt da fonte.
-            """
-        )
-
-with crypto_tab:
-    render_category("Cripto/Commodities", DEFAULT_ASSETS["Cripto/Commodities"])
-    st.caption(
-        "Ouro está representado pelo contrato futuro GC=F. "
-        "O ETF GLD pode ser usado como alternativa."
+if not custom_assets:
+    st.info(
+        "Adicione tickers pela barra lateral. Eles aparecerão automaticamente "
+        "nesta seção quando não pertencerem às categorias padrão."
     )
-
-with tech_tab:
-    render_category("Tech/IA", DEFAULT_ASSETS["Tech/IA"])
-
-with cyber_tab:
-    render_category("Cybersecurity", DEFAULT_ASSETS["Cybersecurity"])
-
-with custom_tab:
-    custom_assets = [
-        {"ticker": ticker, "name": "Ativo personalizado"}
-        for ticker in st.session_state.custom_tickers
-    ]
-
-    if not custom_assets:
-        st.info(
-            "Adicione tickers pela barra lateral para criar uma lista "
-            "personalizada."
-        )
-    else:
-        render_category("Meus Tickers", custom_assets)
+else:
+    render_asset_grid(custom_assets)
 
 st.divider()
 st.caption(
