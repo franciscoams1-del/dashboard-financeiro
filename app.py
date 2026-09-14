@@ -412,9 +412,3 @@ st.caption(
     "Dashboard educacional. Não constitui recomendação de investimento. "
     "Valide os dados diretamente com fontes oficiais antes de tomar decisões financeiras."
 )
-# requirements.txt
-streamlit>=1.35.0
-streamlit-autorefresh>=1.0.1
-yfinance>=0.2.40
-plotly>=5.20.0
-pandas>=2.0.0
