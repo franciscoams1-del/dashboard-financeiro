@@ -1,414 +1,1124 @@
-# app.py
 """
-Dashboard de monitoramento de mercado com Streamlit, yfinance e Plotly.
-Execução local:
+Dashboard avançado de monitoramento de mercado.
+
+Execute com:
     streamlit run app.py
-Observações:
-- Os dados do Yahoo Finance podem apresentar atraso, dependendo do ativo e da bolsa.
-- O índice Fear & Greed e o GRP Index não possuem tickers nativos confiáveis no
-  Yahoo Finance. O código contém placeholders e instruções para integração futura.
+
+O aplicativo usa dados do Yahoo Finance. As cotações intraday podem ter atraso
+e alguns ativos podem não disponibilizar demonstrações financeiras.
 """
+
 from __future__ import annotations
+
+import hashlib
+import html
 from typing import Any
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 from streamlit_autorefresh import st_autorefresh
+
+
 # ---------------------------------------------------------------------------
-# Configuração da página
+# Configuração e universo inicial
 # ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="Market Monitor",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-# ---------------------------------------------------------------------------
-# Configuração dos ativos
-# ---------------------------------------------------------------------------
+
+
 DEFAULT_ASSETS: dict[str, list[dict[str, str]]] = {
-    "Macro & Índices": [
+    "Macro": [
         {"ticker": "SPY", "name": "S&P 500 ETF"},
         {"ticker": "^VIX", "name": "Índice VIX"},
         {"ticker": "DX-Y.NYB", "name": "Dólar Index DXY"},
     ],
-    "Cripto & Commodities": [
+    "Cripto/Commodities": [
         {"ticker": "BTC-USD", "name": "Bitcoin"},
         {"ticker": "GC=F", "name": "Ouro — Futuros"},
     ],
-    "Tech, IA & Semicondutores": [
+    "Tech/IA": [
         {"ticker": "NBIS", "name": "Nebius"},
         {"ticker": "OKLO", "name": "Oklo"},
         {"ticker": "000660.KS", "name": "SK Hynix"},
         {"ticker": "NVDA", "name": "NVIDIA — proxy CoreWeave"},
     ],
-    "Segurança Cloud (Cybersecurity)": [
+    "Cybersecurity": [
         {"ticker": "NET", "name": "Cloudflare"},
         {"ticker": "CRWD", "name": "CrowdStrike"},
         {"ticker": "PANW", "name": "Palo Alto Networks"},
         {"ticker": "ZS", "name": "Zscaler"},
     ],
 }
-# ---------------------------------------------------------------------------
-# Estado da sessão
-# ---------------------------------------------------------------------------
+
+
 if "custom_tickers" not in st.session_state:
     st.session_state.custom_tickers = []
+
+
 # ---------------------------------------------------------------------------
-# Funções auxiliares
+# CSS dos cards
 # ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    .market-card {
+        min-height: 218px;
+        padding: 18px 18px 14px 18px;
+        border-radius: 16px;
+        color: #ffffff;
+        margin-bottom: 8px;
+        border: 1px solid rgba(255,255,255,.10);
+        box-shadow: 0 8px 24px rgba(0,0,0,.18);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .market-card-positive {
+        background: linear-gradient(145deg, #155b3a 0%, #0b3426 100%);
+    }
+
+    .market-card-negative {
+        background: linear-gradient(145deg, #702e36 0%, #3f1b23 100%);
+    }
+
+    .market-card-neutral {
+        background: linear-gradient(145deg, #34445b 0%, #202b3d 100%);
+    }
+
+    .market-card .asset-name {
+        color: rgba(255,255,255,.82);
+        font-size: .88rem;
+        font-weight: 600;
+        min-height: 22px;
+    }
+
+    .market-card .ticker {
+        color: rgba(255,255,255,.60);
+        font-size: .75rem;
+        letter-spacing: .06em;
+        text-transform: uppercase;
+    }
+
+    .market-card .price {
+        font-size: 1.75rem;
+        font-weight: 750;
+        line-height: 1.15;
+        margin-top: 14px;
+    }
+
+    .market-card .change {
+        font-size: 1rem;
+        font-weight: 700;
+        margin-top: 4px;
+    }
+
+    .market-card .moving-averages {
+        border-top: 1px solid rgba(255,255,255,.16);
+        color: rgba(255,255,255,.75);
+        font-size: .72rem;
+        line-height: 1.55;
+        margin-top: 15px;
+        padding-top: 10px;
+    }
+
+    .market-card .year-ago {
+        color: rgba(255,255,255,.72);
+        font-size: .72rem;
+        margin-top: 7px;
+    }
+
+    div[data-testid="stHorizontalBlock"] {
+        gap: 1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Utilitários gerais
+# ---------------------------------------------------------------------------
+
 def normalize_ticker(ticker: str) -> str:
-    """Normaliza um ticker informado pelo usuário."""
+    """Normaliza um ticker informado na sidebar."""
     return ticker.strip().upper()
-def format_price(value: float) -> str:
-    """Formata preços sem assumir uma moeda específica."""
+
+
+def ticker_key(ticker: str) -> str:
+    """Cria uma chave estável e segura para widgets do Streamlit."""
+    return hashlib.md5(ticker.encode("utf-8")).hexdigest()[:10]
+
+
+def safe_float(value: Any) -> float | None:
+    """Converte números vindos de yfinance sem propagar exceções."""
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_price(value: float | None) -> str:
+    """Formata preço sem assumir que todos os ativos estão em USD."""
+    if value is None:
+        return "N/A"
     if abs(value) >= 1000:
         return f"{value:,.2f}"
     return f"{value:,.4f}"
+
+
+def format_percent(value: float | None) -> str:
+    """Formata uma taxa percentual."""
+    return "N/A" if value is None else f"{value:+.2f}%"
+
+
+def format_compact_number(value: float | None) -> str:
+    """Formata valores financeiros grandes de forma compacta."""
+    if value is None:
+        return "N/A"
+
+    absolute = abs(value)
+    sign = "-" if value < 0 else ""
+
+    if absolute >= 1_000_000_000_000:
+        return f"{sign}{absolute / 1_000_000_000_000:.2f}T"
+    if absolute >= 1_000_000_000:
+        return f"{sign}{absolute / 1_000_000_000:.2f}B"
+    if absolute >= 1_000_000:
+        return f"{sign}{absolute / 1_000_000:.2f}M"
+    if absolute >= 1_000:
+        return f"{sign}{absolute / 1_000:.2f}K"
+    return f"{value:,.2f}"
+
+
+def normalize_close_history(history: pd.DataFrame) -> pd.DataFrame:
+    """Extrai e normaliza a série Close, inclusive em respostas MultiIndex."""
+    if history.empty:
+        return pd.DataFrame(columns=["Data", "Preço"])
+
+    close_column: Any = "Close"
+
+    if isinstance(history.columns, pd.MultiIndex):
+        candidates = [
+            column
+            for column in history.columns
+            if str(column[0]).lower() == "close"
+        ]
+        if not candidates:
+            return pd.DataFrame(columns=["Data", "Preço"])
+        close_column = candidates[0]
+
+    close = pd.to_numeric(history[close_column], errors="coerce").dropna()
+
+    if close.empty:
+        return pd.DataFrame(columns=["Data", "Preço"])
+
+    dates = pd.to_datetime(close.index, errors="coerce")
+    if getattr(dates, "tz", None) is not None:
+        dates = dates.tz_localize(None)
+
+    return pd.DataFrame(
+        {
+            "Data": dates,
+            "Preço": close.to_numpy(),
+        }
+    ).dropna()
+
+
+def statement_series(
+    statement: pd.DataFrame | None,
+    labels: list[str],
+) -> pd.Series | None:
+    """
+    Localiza uma linha de demonstração financeira por vários nomes possíveis.
+    O Yahoo Finance altera alguns nomes entre ativos e períodos.
+    """
+    if statement is None or statement.empty:
+        return None
+
+    normalized_labels = {
+        label.lower().replace(" ", "").replace("_", "")
+        for label in labels
+    }
+
+    for index_label in statement.index:
+        normalized_index = (
+            str(index_label).lower().replace(" ", "").replace("_", "")
+        )
+        if normalized_index in normalized_labels:
+            series = pd.to_numeric(statement.loc[index_label], errors="coerce")
+            return series.dropna()
+
+    return None
+
+
+def latest_statement_value(
+    statement: pd.DataFrame | None,
+    labels: list[str],
+    position: int = 0,
+) -> float | None:
+    """Retorna o valor mais recente, ou o valor na posição solicitada."""
+    series = statement_series(statement, labels)
+    if series is None or len(series) <= position:
+        return None
+    return safe_float(series.iloc[position])
+
+
+def sum_statement_values(
+    statement: pd.DataFrame | None,
+    labels: list[str],
+    start: int = 0,
+    count: int = 4,
+) -> float | None:
+    """Soma períodos de uma demonstração para aproximar um LTM."""
+    series = statement_series(statement, labels)
+    if series is None or len(series) <= start:
+        return None
+
+    values = pd.to_numeric(
+        series.iloc[start : start + count],
+        errors="coerce",
+    ).dropna()
+
+    if values.empty:
+        return None
+
+    return safe_float(values.sum())
+
+
+# ---------------------------------------------------------------------------
+# Dados de mercado
+# ---------------------------------------------------------------------------
+
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ticker_data(ticker: str) -> tuple[pd.DataFrame | None, float | None, float | None, str | None]:
-    """
-    Busca aproximadamente três meses de dados históricos.
-    Retorna:
-        histórico normalizado, preço mais recente, variação percentual e erro.
-    """
+def fetch_market_data(ticker: str) -> dict[str, Any]:
+    """Baixa um ano de histórico e calcula preço, variação e médias móveis."""
     try:
         history = yf.Ticker(ticker).history(
-            period="3mo",
+            period="1y",
             interval="1d",
             auto_adjust=False,
             actions=False,
         )
-        if history is None or history.empty:
-            return None, None, None, (
-                f"O Yahoo Finance não retornou dados para o ticker {ticker}."
-            )
-        close_column: Any = "Close"
-        if isinstance(history.columns, pd.MultiIndex):
-            close_candidates = [
-                column
-                for column in history.columns
-                if str(column[0]).lower() == "close"
-            ]
-            if not close_candidates:
-                return None, None, None, (
-                    f"Não foi possível encontrar preços de fechamento para {ticker}."
-                )
-            close_column = close_candidates[0]
-        close = pd.to_numeric(history[close_column], errors="coerce").dropna()
-        if close.empty:
-            return None, None, None, (
-                f"Não existem preços válidos disponíveis para {ticker}."
-            )
-        dates = pd.to_datetime(close.index, errors="coerce")
-        if getattr(dates, "tz", None) is not None:
-            dates = dates.tz_localize(None)
-        chart_data = pd.DataFrame(
-            {
-                "Data": dates,
-                "Preço": close.to_numpy(),
-            }
-        ).dropna()
-        if chart_data.empty:
-            return None, None, None, (
-                f"Não foi possível preparar o histórico de {ticker}."
-            )
-        latest_price = float(chart_data["Preço"].iloc[-1])
-        if len(chart_data) >= 2:
-            previous_price = float(chart_data["Preço"].iloc[-2])
-            if previous_price != 0:
-                change_percent = ((latest_price / previous_price) - 1) * 100
-            else:
-                change_percent = None
-        else:
-            change_percent = None
-        return chart_data, latest_price, change_percent, None
-    except Exception as error:
-        return None, None, None, (
-            f"Não foi possível carregar {ticker}. "
-            f"O ativo pode estar indisponível ou o ticker pode ser inválido."
-        )
-def render_asset_metrics(
-    assets: list[dict[str, str]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Renderiza métricas dos ativos e retorna dados válidos e avisos."""
-    valid_assets: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    columns_per_row = 4
-    for row_start in range(0, len(assets), columns_per_row):
-        row_assets = assets[row_start : row_start + columns_per_row]
-        columns = st.columns(len(row_assets))
-        for column, asset in zip(columns, row_assets):
-            ticker = asset["ticker"]
-            name = asset["name"]
-            chart_data, latest_price, change_percent, error = fetch_ticker_data(ticker)
-            with column:
-                if error or chart_data is None or latest_price is None:
-                    warnings.append(error or f"Dados indisponíveis para {ticker}.")
-                    st.metric(
-                        label=f"{name} ({ticker})",
-                        value="N/D",
-                        delta="Sem dados",
-                    )
-                    continue
-                formatted_change = (
-                    f"{change_percent:+.2f}%"
-                    if change_percent is not None
-                    else "N/D"
-                )
-                st.metric(
-                    label=f"{name} ({ticker})",
-                    value=format_price(latest_price),
-                    delta=formatted_change,
-                )
-                valid_assets.append(
-                    {
-                        "ticker": ticker,
-                        "name": name,
-                        "data": chart_data,
-                    }
-                )
-    return valid_assets, warnings
-def render_price_chart(
-    assets: list[dict[str, Any]],
-    title: str,
-) -> None:
-    """Cria um gráfico interativo com o histórico dos ativos válidos."""
-    if not assets:
-        st.info("Nenhum ativo válido disponível para exibição no gráfico.")
-        return
-    figure = go.Figure()
-    for asset in assets:
-        chart_data = asset["data"]
-        figure.add_trace(
-            go.Scatter(
-                x=chart_data["Data"],
-                y=chart_data["Preço"],
-                mode="lines",
-                name=f'{asset["name"]} ({asset["ticker"]})',
-                hovertemplate=(
-                    f'{asset["name"]}<br>'
-                    "Data: %{x|%d/%m/%Y}<br>"
-                    "Preço: %{y:,.4f}"
-                    "<extra></extra>"
+        data = normalize_close_history(history)
+
+        if data.empty:
+            return {
+                "ticker": ticker,
+                "error": (
+                    f"O Yahoo Finance não retornou histórico para {ticker}."
                 ),
+            }
+
+        data["MM7"] = data["Preço"].rolling(7, min_periods=1).mean()
+        data["MM30"] = data["Preço"].rolling(30, min_periods=1).mean()
+        data["MM180"] = data["Preço"].rolling(180, min_periods=1).mean()
+
+        latest_price = safe_float(data["Preço"].iloc[-1])
+        previous_price = (
+            safe_float(data["Preço"].iloc[-2])
+            if len(data) >= 2
+            else None
+        )
+
+        daily_change = None
+        if latest_price is not None and previous_price not in (None, 0):
+            daily_change = ((latest_price / previous_price) - 1) * 100
+
+        return {
+            "ticker": ticker,
+            "history": data,
+            "price": latest_price,
+            "daily_change": daily_change,
+            "mm7": safe_float(data["MM7"].iloc[-1]),
+            "mm30": safe_float(data["MM30"].iloc[-1]),
+            "mm180": safe_float(data["MM180"].iloc[-1]),
+            "one_year_ago": safe_float(data["Preço"].iloc[0]),
+            "error": None,
+        }
+    except Exception:
+        return {
+            "ticker": ticker,
+            "error": (
+                f"Não foi possível carregar {ticker}. "
+                "Verifique se o ticker é válido no Yahoo Finance."
+            ),
+        }
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_intraday_data(ticker: str, last_five_days: bool) -> pd.DataFrame:
+    """Busca dados intraday para o gráfico do modal."""
+    try:
+        if last_five_days:
+            period, interval = "5d", "15m"
+        else:
+            period, interval = "1d", "5m"
+
+        history = yf.Ticker(ticker).history(
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            actions=False,
+        )
+
+        if history.empty:
+            return pd.DataFrame(columns=["Data", "Preço"])
+
+        return normalize_close_history(history)
+    except Exception:
+        return pd.DataFrame(columns=["Data", "Preço"])
+
+
+# ---------------------------------------------------------------------------
+# Fundamentos e métricas LTM
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_fundamentals(ticker: str, current_price: float | None) -> dict[str, Any]:
+    """
+    Extrai métricas fundamentalistas com fallback e tratamento de exceções.
+
+    Para ETFs, índices, futuros e criptoativos, as métricas corporativas são
+    explicitamente marcadas como não aplicáveis.
+    """
+    empty = {
+        "enterprise_value": None,
+        "market_cap": None,
+        "net_debt": None,
+        "net_debt_ebitda": None,
+        "net_income_ltm": None,
+        "pe_ltm": None,
+        "pe_realtime": None,
+        "roic": None,
+        "roiic": None,
+        "not_applicable": False,
+        "note": None,
+    }
+
+    try:
+        security = yf.Ticker(ticker)
+
+        try:
+            info = security.info or {}
+        except Exception:
+            info = {}
+
+        quote_type = str(info.get("quoteType", "")).upper()
+        known_non_corporate = (
+            ticker.startswith("^")
+            or ticker.endswith("-USD")
+            or ticker.endswith("=F")
+            or ticker in {"SPY", "GLD", "DX-Y.NYB"}
+        )
+
+        if quote_type in {
+            "ETF",
+            "INDEX",
+            "CRYPTOCURRENCY",
+            "FUTURE",
+            "CURRENCY",
+        } or known_non_corporate:
+            empty["not_applicable"] = True
+            empty["note"] = (
+                "Não aplicável: o ativo não possui demonstrações financeiras "
+                "corporativas comparáveis."
+            )
+            return empty
+
+        try:
+            financials = security.financials
+        except Exception:
+            financials = pd.DataFrame()
+
+        try:
+            quarterly_financials = security.quarterly_financials
+        except Exception:
+            quarterly_financials = pd.DataFrame()
+
+        try:
+            cashflow = security.cashflow
+        except Exception:
+            cashflow = pd.DataFrame()
+
+        try:
+            quarterly_cashflow = security.quarterly_cashflow
+        except Exception:
+            quarterly_cashflow = pd.DataFrame()
+
+        try:
+            balance_sheet = security.balance_sheet
+        except Exception:
+            balance_sheet = pd.DataFrame()
+
+        try:
+            quarterly_balance_sheet = security.quarterly_balance_sheet
+        except Exception:
+            quarterly_balance_sheet = pd.DataFrame()
+
+        enterprise_value = safe_float(info.get("enterpriseValue"))
+        market_cap = safe_float(info.get("marketCap"))
+
+        total_debt = (
+            latest_statement_value(
+                quarterly_balance_sheet,
+                [
+                    "Total Debt",
+                    "TotalDebt",
+                    "Long Term Debt And Capital Lease Obligation",
+                ],
+            )
+            or latest_statement_value(
+                balance_sheet,
+                [
+                    "Total Debt",
+                    "TotalDebt",
+                    "Long Term Debt And Capital Lease Obligation",
+                ],
+            )
+            or safe_float(info.get("totalDebt"))
+        )
+
+        cash = (
+            latest_statement_value(
+                quarterly_balance_sheet,
+                [
+                    "Cash Cash Equivalents And Short Term Investments",
+                    "Cash And Cash Equivalents",
+                    "CashAndCashEquivalents",
+                ],
+            )
+            or latest_statement_value(
+                balance_sheet,
+                [
+                    "Cash Cash Equivalents And Short Term Investments",
+                    "Cash And Cash Equivalents",
+                    "CashAndCashEquivalents",
+                ],
+            )
+            or safe_float(info.get("totalCash"))
+        )
+
+        net_debt = (
+            total_debt - cash
+            if total_debt is not None and cash is not None
+            else None
+        )
+
+        ebitda = (
+            safe_float(info.get("ebitda"))
+            or sum_statement_values(
+                quarterly_financials,
+                ["EBITDA", "Normalized EBITDA"],
+            )
+            or latest_statement_value(
+                financials,
+                ["EBITDA", "Normalized EBITDA"],
             )
         )
-    figure.update_layout(
-        title=title,
-        template="plotly_dark",
-        height=500,
-        hovermode="x unified",
-        margin=dict(l=20, r=20, t=60, b=20),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0,
-        ),
-        xaxis_title="Data",
-        yaxis_title="Preço de fechamento",
+
+        net_income_ltm = (
+            safe_float(info.get("netIncomeToCommon"))
+            or sum_statement_values(
+                quarterly_financials,
+                ["Net Income", "NetIncome", "Net Income Common Stockholders"],
+            )
+            or latest_statement_value(
+                financials,
+                ["Net Income", "NetIncome", "Net Income Common Stockholders"],
+            )
+        )
+
+        pe_ltm = safe_float(info.get("trailingPE"))
+        eps_ltm = safe_float(info.get("trailingEps"))
+        pe_realtime = (
+            current_price / eps_ltm
+            if current_price is not None and eps_ltm not in (None, 0)
+            else None
+        )
+
+        operating_income_ltm = (
+            sum_statement_values(
+                quarterly_financials,
+                ["Operating Income", "OperatingIncome"],
+            )
+            or latest_statement_value(
+                financials,
+                ["Operating Income", "OperatingIncome"],
+            )
+        )
+
+        # Alguns emissores não publicam EBITDA diretamente. Nessa situação,
+        # aproximamos EBITDA como EBIT + depreciação/amortização usando
+        # financials/cashflow e seus equivalentes trimestrais.
+        if ebitda is None:
+            depreciation_ltm = (
+                sum_statement_values(
+                    quarterly_cashflow,
+                    [
+                        "Depreciation And Amortization",
+                        "Depreciation",
+                        "Depreciation And Amortization In Cash Flow",
+                    ],
+                )
+                or latest_statement_value(
+                    cashflow,
+                    [
+                        "Depreciation And Amortization",
+                        "Depreciation",
+                        "Depreciation And Amortization In Cash Flow",
+                    ],
+                )
+            )
+
+            if operating_income_ltm is not None and depreciation_ltm is not None:
+                ebitda = operating_income_ltm + depreciation_ltm
+
+        net_debt_ebitda = (
+            net_debt / ebitda
+            if net_debt is not None and ebitda not in (None, 0)
+            else safe_float(info.get("debtToEbitda"))
+        )
+
+        pretax_income_ltm = (
+            sum_statement_values(
+                quarterly_financials,
+                ["Pretax Income", "PretaxIncome"],
+            )
+            or latest_statement_value(
+                financials,
+                ["Pretax Income", "PretaxIncome"],
+            )
+        )
+
+        tax_provision_ltm = (
+            sum_statement_values(
+                quarterly_financials,
+                ["Tax Provision", "TaxProvision"],
+            )
+            or latest_statement_value(
+                financials,
+                ["Tax Provision", "TaxProvision"],
+            )
+        )
+
+        tax_rate = safe_float(info.get("taxRate"))
+        if tax_rate is None and pretax_income_ltm not in (None, 0):
+            if tax_provision_ltm is not None:
+                tax_rate = tax_provision_ltm / pretax_income_ltm
+
+        if tax_rate is None or tax_rate < 0 or tax_rate > 1:
+            tax_rate = 0.21
+
+        nopat = (
+            operating_income_ltm * (1 - tax_rate)
+            if operating_income_ltm is not None
+            else None
+        )
+
+        equity = (
+            latest_statement_value(
+                quarterly_balance_sheet,
+                [
+                    "Stockholders Equity",
+                    "StockholdersEquity",
+                    "Total Equity Gross Minority Interest",
+                    "Total Equity",
+                ],
+            )
+            or latest_statement_value(
+                balance_sheet,
+                [
+                    "Stockholders Equity",
+                    "StockholdersEquity",
+                    "Total Equity Gross Minority Interest",
+                    "Total Equity",
+                ],
+            )
+        )
+
+        invested_capital = (
+            equity + total_debt - cash
+            if equity is not None and total_debt is not None and cash is not None
+            else None
+        )
+
+        roic = (
+            nopat / invested_capital
+            if nopat is not None and invested_capital not in (None, 0)
+            else None
+        )
+
+        # ROIIC aproximado: variação do NOPAT LTM dividida pela variação
+        # do capital investido entre o período atual e aproximadamente um ano
+        # antes. Quando não existem oito trimestres, o resultado fica N/A.
+        prior_operating_income = sum_statement_values(
+            quarterly_financials,
+            ["Operating Income", "OperatingIncome"],
+            start=4,
+            count=4,
+        )
+        prior_equity = latest_statement_value(
+            quarterly_balance_sheet,
+            [
+                "Stockholders Equity",
+                "StockholdersEquity",
+                "Total Equity Gross Minority Interest",
+                "Total Equity",
+            ],
+            position=4,
+        )
+        prior_debt = latest_statement_value(
+            quarterly_balance_sheet,
+            [
+                "Total Debt",
+                "TotalDebt",
+                "Long Term Debt And Capital Lease Obligation",
+            ],
+            position=4,
+        )
+        prior_cash = latest_statement_value(
+            quarterly_balance_sheet,
+            [
+                "Cash Cash Equivalents And Short Term Investments",
+                "Cash And Cash Equivalents",
+                "CashAndCashEquivalents",
+            ],
+            position=4,
+        )
+
+        prior_invested_capital = (
+            prior_equity + prior_debt - prior_cash
+            if (
+                prior_equity is not None
+                and prior_debt is not None
+                and prior_cash is not None
+            )
+            else None
+        )
+
+        prior_nopat = (
+            prior_operating_income * (1 - tax_rate)
+            if prior_operating_income is not None
+            else None
+        )
+
+        invested_capital_delta = (
+            invested_capital - prior_invested_capital
+            if invested_capital is not None and prior_invested_capital is not None
+            else None
+        )
+
+        roiic = (
+            (nopat - prior_nopat) / invested_capital_delta
+            if (
+                nopat is not None
+                and prior_nopat is not None
+                and invested_capital_delta not in (None, 0)
+            )
+            else None
+        )
+
+        return {
+            **empty,
+            "enterprise_value": enterprise_value,
+            "market_cap": market_cap,
+            "net_debt": net_debt,
+            "net_debt_ebitda": net_debt_ebitda,
+            "net_income_ltm": net_income_ltm,
+            "pe_ltm": pe_ltm,
+            "pe_realtime": pe_realtime,
+            "roic": roic,
+            "roiic": roiic,
+            "note": (
+                "ROIC e ROIIC são aproximações calculadas a partir das "
+                "demonstrações disponíveis no Yahoo Finance."
+            ),
+        }
+
+    except Exception:
+        return {
+            **empty,
+            "note": (
+                "Fundamentos indisponíveis para este ativo. "
+                "Os dados de mercado continuam sendo exibidos."
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Componentes de interface
+# ---------------------------------------------------------------------------
+
+def card_class(daily_change: float | None) -> str:
+    """Seleciona a cor do card com base na variação diária."""
+    if daily_change is None:
+        return "market-card-neutral"
+    return "market-card-positive" if daily_change >= 0 else "market-card-negative"
+
+
+def render_market_card(asset: dict[str, str], data: dict[str, Any]) -> bool:
+    """Renderiza um card e retorna True quando o usuário abre os detalhes."""
+    ticker = asset["ticker"]
+    name = asset["name"]
+    price = data.get("price")
+    change = data.get("daily_change")
+
+    if data.get("error"):
+        st.markdown(
+            f"""
+            <div class="market-card market-card-neutral">
+                <div class="asset-name">{html.escape(name)}</div>
+                <div class="ticker">{html.escape(ticker)}</div>
+                <div class="price">N/A</div>
+                <div class="change">Dados indisponíveis</div>
+                <div class="moving-averages">
+                    O Yahoo Finance não retornou um histórico válido.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.warning(data["error"])
+        return False
+
+    card_html = f"""
+        <div class="market-card {card_class(change)}">
+            <div class="asset-name">{html.escape(name)}</div>
+            <div class="ticker">{html.escape(ticker)}</div>
+            <div class="price">{format_price(price)}</div>
+            <div class="change">{format_percent(change)}</div>
+            <div class="moving-averages">
+                MM7: {format_price(data.get("mm7"))}
+                &nbsp;·&nbsp; MM30: {format_price(data.get("mm30"))}
+                &nbsp;·&nbsp; MM180: {format_price(data.get("mm180"))}
+            </div>
+            <div class="year-ago">
+                Preço há 1 ano: {format_price(data.get("one_year_ago"))}
+            </div>
+        </div>
+    """
+
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    return st.button(
+        "Ver Detalhes",
+        key=f"details_{ticker_key(ticker)}",
+        use_container_width=True,
     )
+
+
+def render_intraday_chart(
+    ticker: str,
+    history: pd.DataFrame,
+    last_five_days: bool,
+) -> None:
+    """Renderiza o gráfico intraday com eixo Y ajustado ao intervalo observado."""
+    if history.empty:
+        st.warning(
+            f"Não há dados intraday disponíveis para {ticker} "
+            "neste momento."
+        )
+        return
+
+    minimum = float(history["Preço"].min())
+    maximum = float(history["Preço"].max())
+    observed_range = maximum - minimum
+    padding = observed_range * 0.12 if observed_range else max(abs(minimum) * 0.002, 0.01)
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=history["Data"],
+            y=history["Preço"],
+            mode="lines",
+            line=dict(color="#55d68a", width=2),
+            name=ticker,
+            hovertemplate=(
+                "Data: %{x|%d/%m %H:%M}<br>"
+                "Preço: %{y:,.4f}<extra></extra>"
+            ),
+        )
+    )
+
+    figure.update_layout(
+        template="plotly_dark",
+        height=410,
+        margin=dict(l=15, r=15, t=25, b=15),
+        showlegend=False,
+        hovermode="x unified",
+        xaxis_title="Horário",
+        yaxis_title="Preço",
+        yaxis=dict(range=[minimum - padding, maximum + padding]),
+    )
+
     st.plotly_chart(
         figure,
         use_container_width=True,
-        config={
-            "displaylogo": False,
-            "responsive": True,
-        },
+        config={"displaylogo": False, "responsive": True},
     )
-def render_category(
-    category_name: str,
-    assets: list[dict[str, str]],
+
+
+def render_fundamental_metrics(
+    ticker: str,
+    current_price: float | None,
 ) -> None:
-    """Renderiza métricas e gráfico de uma categoria."""
-    st.subheader(category_name)
-    valid_assets, warnings = render_asset_metrics(assets)
-    if warnings:
-        for warning in sorted(set(warnings)):
-            st.warning(warning)
-    st.divider()
-    render_price_chart(
-        valid_assets,
-        title=f"Histórico de preços — {category_name} — últimos 3 meses",
-    )
-def create_custom_assets() -> list[dict[str, str]]:
-    """Converte os tickers personalizados em ativos exibíveis."""
-    return [
-        {
-            "ticker": ticker,
-            "name": f"Ativo personalizado",
-        }
-        for ticker in st.session_state.custom_tickers
+    """Renderiza as métricas fundamentalistas dentro do modal."""
+    metrics = fetch_fundamentals(ticker, current_price)
+
+    if metrics.get("not_applicable"):
+        st.info(
+            metrics.get("note")
+            or "Métricas fundamentalistas não aplicáveis a este ativo."
+        )
+        return
+
+    values = [
+        ("Enterprise Value LTM", format_compact_number(metrics["enterprise_value"])),
+        ("Equity Value / Market Cap", format_compact_number(metrics["market_cap"])),
+        ("Dívida Líquida LTM", format_compact_number(metrics["net_debt"])),
+        ("Dívida Líquida / EBITDA", format_compact_number(metrics["net_debt_ebitda"])),
+        ("Lucro Líquido LTM", format_compact_number(metrics["net_income_ltm"])),
+        ("P/E LTM", format_compact_number(metrics["pe_ltm"])),
+        ("P/E em tempo real", format_compact_number(metrics["pe_realtime"])),
+        ("ROIC LTM", format_percent(
+            metrics["roic"] * 100 if metrics["roic"] is not None else None
+        )),
+        ("ROIIC LTM", format_percent(
+            metrics["roiic"] * 100 if metrics["roiic"] is not None else None
+        )),
     ]
+
+    for row_start in range(0, len(values), 3):
+        row = values[row_start : row_start + 3]
+        columns = st.columns(len(row))
+        for column, (label, value) in zip(columns, row):
+            with column:
+                st.metric(label, value)
+
+    if metrics.get("note"):
+        st.caption(metrics["note"])
+
+
+@st.dialog("Detalhes do ativo")
+def show_asset_details(
+    asset: dict[str, str],
+    market_data: dict[str, Any],
+) -> None:
+    """Modal com gráfico intraday e fundamentos."""
+    ticker = asset["ticker"]
+    name = asset["name"]
+    current_price = market_data.get("price")
+
+    st.subheader(f"{name} ({ticker})")
+    st.caption(
+        f"Preço atual: {format_price(current_price)} · "
+        f"Variação do dia: {format_percent(market_data.get('daily_change'))}"
+    )
+
+    last_five_days = st.toggle(
+        "Ver Últimos 5 Dias",
+        value=False,
+        key=f"range_{ticker_key(ticker)}",
+    )
+
+    intraday = fetch_intraday_data(ticker, last_five_days)
+    render_intraday_chart(ticker, intraday, last_five_days)
+
+    st.divider()
+    st.subheader("Métricas fundamentalistas")
+    render_fundamental_metrics(ticker, current_price)
+
+
+def render_asset_grid(assets: list[dict[str, str]]) -> None:
+    """Renderiza quatro cards por linha."""
+    for start in range(0, len(assets), 4):
+        row = assets[start : start + 4]
+        columns = st.columns(len(row))
+
+        for column, asset in zip(columns, row):
+            with column:
+                data = fetch_market_data(asset["ticker"])
+                open_details = render_market_card(asset, data)
+                if open_details and not data.get("error"):
+                    show_asset_details(asset, data)
+
+
+def render_category(category: str, assets: list[dict[str, str]]) -> None:
+    """Renderiza uma categoria completa."""
+    st.subheader(category)
+    render_asset_grid(assets)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+
 with st.sidebar:
     st.header("⚙️ Configurações")
+
     st.subheader("Tickers padrão")
     for category, assets in DEFAULT_ASSETS.items():
         with st.expander(category, expanded=False):
             for asset in assets:
                 st.write(f"**{asset['ticker']}** — {asset['name']}")
+
     st.divider()
     st.subheader("Adicionar tickers")
+
     ticker_input = st.text_input(
-        "Informe tickers separados por vírgula",
+        "Tickers separados por vírgula",
         placeholder="Ex.: AAPL, MSFT, PETR4.SA",
-        help=(
-            "Use os símbolos aceitos pelo Yahoo Finance. "
-            "Exemplos: AAPL, TSLA, PETR4.SA, ETH-USD."
-        ),
     )
+
     if st.button("Adicionar ativos", use_container_width=True):
-        new_tickers = [
-            normalize_ticker(ticker)
-            for ticker in ticker_input.split(",")
-            if normalize_ticker(ticker)
+        candidates = [
+            normalize_ticker(item)
+            for item in ticker_input.split(",")
+            if normalize_ticker(item)
         ]
-        all_default_tickers = {
+
+        default_tickers = {
             asset["ticker"]
             for assets in DEFAULT_ASSETS.values()
             for asset in assets
         }
-        for ticker in new_tickers:
-            if ticker not in all_default_tickers and ticker not in st.session_state.custom_tickers:
+
+        for ticker in candidates:
+            if (
+                ticker not in default_tickers
+                and ticker not in st.session_state.custom_tickers
+            ):
                 st.session_state.custom_tickers.append(ticker)
-        if new_tickers:
+
+        if candidates:
             st.success("Ticker(s) adicionado(s).")
             st.rerun()
+
     if st.session_state.custom_tickers:
-        st.caption("Ativos personalizados adicionados:")
+        st.caption("Meus tickers:")
         for ticker in st.session_state.custom_tickers:
             st.write(f"• {ticker}")
-        if st.button("Limpar ativos personalizados", use_container_width=True):
+
+        if st.button("Limpar meus tickers", use_container_width=True):
             st.session_state.custom_tickers = []
             st.rerun()
+
     st.divider()
-    auto_refresh = st.checkbox(
-        "Atualização automática",
-        value=True,
-        help="Atualiza os dados periodicamente.",
-    )
+    auto_refresh = st.checkbox("Atualização automática", value=True)
+
     if auto_refresh:
         st_autorefresh(
             interval=60_000,
             limit=None,
-            key="market_dashboard_refresh",
+            key="market_monitor_refresh",
         )
+
     if st.button("🔄 Atualizar agora", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
     st.caption(
-        "Dados fornecidos pelo Yahoo Finance. "
-        "Cotações podem apresentar atraso."
+        "Cotações fornecidas pelo Yahoo Finance. "
+        "O atraso varia por ativo e bolsa."
     )
+
+
 # ---------------------------------------------------------------------------
-# Cabeçalho principal
+# Conteúdo principal
 # ---------------------------------------------------------------------------
-st.title("📊 Market Monitor")
+
+st.title("📈 Market Monitor")
 st.caption(
-    "Monitoramento de índices, criptoativos, commodities, tecnologia e segurança cloud."
+    "Cards coloridos por desempenho diário, médias móveis, comparação anual "
+    "e análise fundamentalista."
 )
-st.info(
-    "Os dados são atualizados automaticamente a cada minuto quando essa opção "
-    "está habilitada. A disponibilidade e o atraso das cotações dependem do Yahoo Finance."
+
+st.warning(
+    """
+    **CoreWeave:** não possui ticker público disponível no Yahoo Finance.
+    O ativo é representado por um alerta e a NVIDIA (NVDA) aparece como proxy
+    do setor de GPUs, infraestrutura de IA e data centers.
+    """
 )
-# ---------------------------------------------------------------------------
-# Abas
-# ---------------------------------------------------------------------------
-tab_macro, tab_crypto, tab_tech, tab_cyber, tab_custom = st.tabs(
+
+macro_tab, crypto_tab, tech_tab, cyber_tab, custom_tab = st.tabs(
     [
-        "Macro & Índices",
-        "Cripto & Commodities",
-        "Tech, IA & Semicondutores",
-        "Segurança Cloud",
+        "Macro",
+        "Cripto/Commodities",
+        "Tech/IA",
+        "Cybersecurity",
         "Meus Tickers",
     ]
 )
-with tab_macro:
-    render_category(
-        "Macro & Índices",
-        DEFAULT_ASSETS["Macro & Índices"],
-    )
+
+with macro_tab:
+    render_category("Macro", DEFAULT_ASSETS["Macro"])
     st.divider()
     st.subheader("Indicadores complementares")
-    fear_greed_column, grp_column = st.columns(2)
-    with fear_greed_column:
+    fear_greed, grp = st.columns(2)
+
+    with fear_greed:
         st.info(
             """
-            **Fear & Greed Index**
-            Placeholder visual.
-            O índice pode ser integrado via:
-            - API pública da Alternative.me;
-            - endpoint de um provedor de dados financeiros;
-            - web scraping autorizado de uma página pública.
-            Exemplo de endpoint:
+            **Fear & Greed Index — placeholder**
+
+            Integração sugerida via API da Alternative.me ou outro provedor
+            autorizado. Exemplo de endpoint:
             `https://api.alternative.me/fng/`
             """
         )
-    with grp_column:
+
+    with grp:
         st.info(
             """
-            **GRP Index**
-            Placeholder visual.
-            Como não existe um ticker nativo confiável no Yahoo Finance,
-            a integração deve ser feita por:
-            - API oficial do provedor do índice;
-            - API de terceiros;
-            - web scraping autorizado, respeitando robots.txt e os termos de uso.
-            Recomenda-se implementar essa fonte em uma função separada,
-            com cache e tratamento de indisponibilidade.
+            **GRP Index — placeholder**
+
+            Como não existe ticker nativo confiável no Yahoo Finance, integre
+            por API oficial de terceiros ou web scraping autorizado, respeitando
+            os termos de uso e o robots.txt da fonte.
             """
         )
-with tab_crypto:
-    render_category(
-        "Cripto & Commodities",
-        DEFAULT_ASSETS["Cripto & Commodities"],
-    )
+
+with crypto_tab:
+    render_category("Cripto/Commodities", DEFAULT_ASSETS["Cripto/Commodities"])
     st.caption(
-        "O ouro está representado pelo contrato futuro GC=F. "
-        "Como alternativa, é possível usar o ETF GLD."
+        "Ouro está representado pelo contrato futuro GC=F. "
+        "O ETF GLD pode ser usado como alternativa."
     )
-with tab_tech:
-    st.warning(
-        """
-        **CoreWeave:** a empresa não possui ticker público negociado em bolsa
-        disponível no Yahoo Finance. Por isso, ela é representada aqui por um
-        placeholder e a NVIDIA (NVDA) é exibida como proxy do setor de GPUs,
-        infraestrutura de IA e data centers.
-        """
-    )
-    st.info(
-        "Quando a CoreWeave possuir um ticker público ou uma fonte de dados "
-        "confiável, substitua o placeholder no dicionário DEFAULT_ASSETS."
-    )
-    render_category(
-        "Tech, IA & Semicondutores",
-        DEFAULT_ASSETS["Tech, IA & Semicondutores"],
-    )
-with tab_cyber:
-    render_category(
-        "Segurança Cloud (Cybersecurity)",
-        DEFAULT_ASSETS["Segurança Cloud (Cybersecurity)"],
-    )
-with tab_custom:
-    custom_assets = create_custom_assets()
+
+with tech_tab:
+    render_category("Tech/IA", DEFAULT_ASSETS["Tech/IA"])
+
+with cyber_tab:
+    render_category("Cybersecurity", DEFAULT_ASSETS["Cybersecurity"])
+
+with custom_tab:
+    custom_assets = [
+        {"ticker": ticker, "name": "Ativo personalizado"}
+        for ticker in st.session_state.custom_tickers
+    ]
+
     if not custom_assets:
         st.info(
-            "Nenhum ticker personalizado foi adicionado. "
-            "Use a barra lateral para adicionar ativos separados por vírgula."
+            "Adicione tickers pela barra lateral para criar uma lista "
+            "personalizada."
         )
     else:
         render_category("Meus Tickers", custom_assets)
-# ---------------------------------------------------------------------------
-# Rodapé
-# ---------------------------------------------------------------------------
+
 st.divider()
 st.caption(
-    "Dashboard educacional. Não constitui recomendação de investimento. "
-    "Valide os dados diretamente com fontes oficiais antes de tomar decisões financeiras."
+    "Os cálculos de ROIC e ROIIC são aproximações baseadas na disponibilidade "
+    "das demonstrações financeiras no Yahoo Finance. Este dashboard não é "
+    "recomendação de investimento."
 )
